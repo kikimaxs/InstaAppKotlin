@@ -33,6 +33,11 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.text.input.VisualTransformation
+import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.viewinterop.AndroidView
+import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.compose.ui.draw.scale
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.BorderStroke
@@ -71,7 +76,11 @@ import androidx.compose.material.icons.filled.KeyboardArrowDown
 import androidx.compose.ui.graphics.ColorFilter
 import androidx.compose.ui.layout.ContentScale
 import com.google.firebase.ktx.Firebase
+import com.google.firebase.storage.ktx.storage
 import com.google.firebase.firestore.ktx.firestore
+import com.example.instaapp.data.FirebaseRepo
+import com.example.instaapp.data.PostItem
+import com.google.firebase.auth.ktx.auth
 import com.google.firebase.FirebaseApp
 import com.google.firebase.firestore.FieldValue
 import java.util.UUID
@@ -97,12 +106,16 @@ enum class AppScreen { Login, SignUp, OTP, Home }
 
 @Composable
 fun InstaAppRoot() {
-    var screen by remember { mutableStateOf(AppScreen.Login) }
+    val initial = if (Firebase.auth.currentUser != null) AppScreen.Home else AppScreen.Login
+    var screen by remember { mutableStateOf(initial) }
     when (screen) {
-        AppScreen.Login -> LoginScreen(onSignUp = { screen = AppScreen.SignUp })
-        AppScreen.SignUp -> SignUpScreen(onNext = { screen = AppScreen.OTP })
+        AppScreen.Login -> LoginScreen(onSignUp = { screen = AppScreen.SignUp }, onLoggedIn = { screen = AppScreen.Home })
+        AppScreen.SignUp -> SignUpScreen(onNext = { screen = AppScreen.Home })
         AppScreen.OTP -> OTPScreen(onBack = { screen = AppScreen.SignUp }, onVerify = { screen = AppScreen.Home })
-        AppScreen.Home -> HomeScreen()
+        AppScreen.Home -> HomeScreen(onLogout = {
+            try { Firebase.auth.signOut() } catch (_: Exception) {}
+            screen = AppScreen.Login
+        })
     }
 }
 
@@ -129,6 +142,8 @@ private fun rememberSvgPainter(projectPath: String): Painter {
     )
 }
 
+ 
+
 private fun listPostImages(ctx: Context): List<String> {
     return try {
         val files = ctx.assets.list("png")?.toList() ?: emptyList()
@@ -146,6 +161,10 @@ data class UserComment(
     var likes: Int,
     var liked: Boolean
 )
+
+ 
+
+// posts are now loaded from Firebase; local persistence removed
 
 private fun loadComments(ctx: Context): List<UserComment> {
     val raw = ctx.getSharedPreferences("comments_store", Context.MODE_PRIVATE).getString("comments", "") ?: ""
@@ -180,39 +199,108 @@ enum class LoginMode { Account, Credential }
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun LoginScreen(onSignUp: () -> Unit) {
+fun LoginScreen(onSignUp: () -> Unit, onLoggedIn: () -> Unit) {
     var mode by remember { mutableStateOf(LoginMode.Account) }
     val context = LocalContext.current
+    var loginError by remember { mutableStateOf<String?>(null) }
+    var isLoggingIn by remember { mutableStateOf(false) }
 
-    when (mode) {
-        LoginMode.Account -> AccountLoginView(
-            onSwitchAccounts = { mode = LoginMode.Credential },
-            onLogin = {
-                mode = LoginMode.Credential
-            },
-            onSignUp = onSignUp
-        )
-        LoginMode.Credential -> CredentialLoginView(
-            onBack = { mode = LoginMode.Account },
-            onSubmit = { _, _ ->
-                android.widget.Toast.makeText(context, "Login", android.widget.Toast.LENGTH_SHORT).show()
-            },
-            onSignUp = onSignUp
-        )
+    Box(modifier = Modifier.fillMaxSize()) {
+        when (mode) {
+            LoginMode.Account -> AccountLoginView(
+                onSwitchAccounts = { mode = LoginMode.Credential },
+                onLogin = {
+                    mode = LoginMode.Credential
+                },
+                onSignUp = onSignUp
+            )
+            LoginMode.Credential -> CredentialLoginView(
+                onBack = { mode = LoginMode.Account },
+                onSubmit = { email, password ->
+                    loginError = null
+                    isLoggingIn = true
+                    try {
+                        val em = email.trim()
+                        if (!android.util.Patterns.EMAIL_ADDRESS.matcher(em).matches()) {
+                            loginError = "Email tidak valid"; isLoggingIn = false; return@CredentialLoginView
+                        }
+                        if (password.length < 6) { loginError = "Password minimal 6 karakter"; isLoggingIn = false; return@CredentialLoginView }
+                        com.example.instaapp.data.FirebaseRepo.loginUser(em, password) { success, err ->
+                            isLoggingIn = false
+                            if (success) {
+                                onLoggedIn()
+                            } else {
+                                loginError = err ?: "Login gagal"
+                            }
+                        }
+                    } catch (e: Exception) {
+                        isLoggingIn = false
+                        loginError = e.message
+                    }
+                },
+                onSignUp = onSignUp
+            )
+        }
+        if (isLoggingIn) {
+            Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                androidx.compose.material3.CircularProgressIndicator()
+            }
+        }
+        if (loginError != null) {
+            ErrorModal(title = "Login gagal", message = loginError!!, onDismiss = { loginError = null })
+        }
+    }
+}
+
+@Composable
+private fun ErrorModal(title: String, message: String, onDismiss: () -> Unit) {
+    Box(modifier = Modifier.fillMaxSize()) {
+        Box(
+            modifier = Modifier
+                .fillMaxSize()
+                .background(Color(0x80000000))
+                .clickable { onDismiss() }
+        ) {}
+        Box(
+            modifier = Modifier
+                .fillMaxSize(),
+            contentAlignment = Alignment.Center
+        ) {
+            Surface(
+                color = Color.White,
+                shadowElevation = 8.dp,
+                shape = androidx.compose.foundation.shape.RoundedCornerShape(12.dp)
+            ) {
+                Column(modifier = Modifier.padding(16.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+                    Text(title, fontWeight = FontWeight.SemiBold)
+                    Spacer(modifier = Modifier.height(12.dp))
+                    Text(message, color = Color(0xFF262626))
+                    Spacer(modifier = Modifier.height(12.dp))
+                    Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
+                        TextButton(onClick = onDismiss) { Text("OK") }
+                    }
+                }
+            }
+        }
     }
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun SignUpScreen(onNext: () -> Unit) {
+    var email by remember { mutableStateOf("") }
     var username by remember { mutableStateOf("") }
     var password by remember { mutableStateOf("") }
     var confirm by remember { mutableStateOf("") }
+    var emailError by remember { mutableStateOf<String?>(null) }
     var usernameError by remember { mutableStateOf<String?>(null) }
     var passwordError by remember { mutableStateOf<String?>(null) }
     var confirmError by remember { mutableStateOf<String?>(null) }
     var showPassword by remember { mutableStateOf(false) }
     var showConfirm by remember { mutableStateOf(false) }
+    var isLoading by remember { mutableStateOf(false) }
+    var registerError by remember { mutableStateOf<String?>(null) }
+    val isFormValid = email.isNotBlank() && username.isNotBlank() && password.isNotBlank() && confirm.isNotBlank() && password == confirm
     Box(
         modifier = Modifier.fillMaxSize(),
         contentAlignment = Alignment.Center
@@ -223,31 +311,38 @@ fun SignUpScreen(onNext: () -> Unit) {
         ) {
             InstagramWordmark()
             Spacer(modifier = Modifier.height(24.dp))
-            Box(
-                modifier = Modifier
-                    .border(
-                        BorderStroke(1.dp, if (usernameError != null) Color(0xFFFF0000) else Color(0xFFE5E7EB)),
-                        androidx.compose.foundation.shape.RoundedCornerShape(8.dp)
-                    )
-            ) {
-                TextField(
-                    value = username,
-                    onValueChange = {
-                        username = it
-                        if (username.isNotBlank()) usernameError = null
-                    },
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .height(48.dp),
-                    placeholder = { Text("Username") },
-                    colors = TextFieldDefaults.textFieldColors(
-                        containerColor = if (usernameError != null) Color(0xFFFFE6E6) else Color(0xFFF3F4F6),
-                        focusedIndicatorColor = Color.Transparent,
-                        unfocusedIndicatorColor = Color.Transparent
-                    ),
-                    shape = androidx.compose.foundation.shape.RoundedCornerShape(8.dp)
+            FormField(
+                value = email,
+                onValueChange = {
+                    email = it
+                    if (email.isNotBlank()) emailError = null
+                },
+                placeholder = "Email",
+                isError = emailError != null,
+                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Email)
+            )
+            Spacer(modifier = Modifier.height(12.dp))
+            if (emailError != null) {
+                val fadeAlpha by animateFloatAsState(1f, tween(200))
+                Text(
+                    text = emailError!!,
+                    color = Color(0xFFFF0000),
+                    fontSize = 12.sp,
+                    fontStyle = FontStyle.Italic,
+                    modifier = Modifier.align(Alignment.Start).graphicsLayer { this.alpha = fadeAlpha }
                 )
             }
+            FormField(
+                value = username,
+                onValueChange = {
+                    username = it
+                    if (username.isNotBlank()) usernameError = null
+                },
+                placeholder = "Username",
+                isError = usernameError != null,
+                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Text)
+            )
+            Spacer(modifier = Modifier.height(12.dp))
             if (usernameError != null) {
                 val fadeAlpha by animateFloatAsState(1f, tween(200))
                 Text(
@@ -259,40 +354,26 @@ fun SignUpScreen(onNext: () -> Unit) {
                 )
             }
             Spacer(modifier = Modifier.height(12.dp))
-            Box(
-                modifier = Modifier
-                    .border(
-                        BorderStroke(1.dp, if (passwordError != null) Color(0xFFFF0000) else Color(0xFFE5E7EB)),
-                        androidx.compose.foundation.shape.RoundedCornerShape(8.dp)
-                    )
-            ) {
-                TextField(
-                    value = password,
-                    onValueChange = {
-                        password = it
-                        if (password.length <= 8) passwordError = null
-                    },
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .height(48.dp),
-                    placeholder = { Text("Password") },
-                    visualTransformation = if (showPassword) androidx.compose.ui.text.input.VisualTransformation.None else PasswordVisualTransformation(),
-                    colors = TextFieldDefaults.textFieldColors(
-                        containerColor = if (passwordError != null) Color(0xFFFFE6E6) else Color(0xFFF3F4F6),
-                        focusedIndicatorColor = Color.Transparent,
-                        unfocusedIndicatorColor = Color.Transparent
-                    ),
-                    shape = androidx.compose.foundation.shape.RoundedCornerShape(8.dp),
-                    trailingIcon = {
-                        val interaction = remember { MutableInteractionSource() }
-                        val pressed by interaction.collectIsPressedAsState()
-                        val scale by animateFloatAsState(if (pressed) 0.9f else 1f, tween(80))
-                        IconButton(onClick = { showPassword = !showPassword }, interactionSource = interaction, modifier = Modifier.scale(scale)) {
-                            Icon(if (showPassword) Icons.Filled.VisibilityOff else Icons.Filled.Visibility, contentDescription = "Toggle password")
-                        }
+            FormField(
+                value = password,
+                onValueChange = {
+                    password = it
+                    if (password.length >= 6) passwordError = null
+                },
+                placeholder = "Password",
+                isError = passwordError != null,
+                trailingIcon = {
+                    val interaction = remember { MutableInteractionSource() }
+                    val pressed by interaction.collectIsPressedAsState()
+                    val scale by animateFloatAsState(if (pressed) 0.9f else 1f, tween(80))
+                    IconButton(onClick = { showPassword = !showPassword }, interactionSource = interaction, modifier = Modifier.scale(scale)) {
+                        Icon(if (showPassword) Icons.Filled.VisibilityOff else Icons.Filled.Visibility, contentDescription = "Toggle password")
                     }
-                )
-            }
+                },
+                visualTransformation = if (showPassword) androidx.compose.ui.text.input.VisualTransformation.None else PasswordVisualTransformation(),
+                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password)
+            )
+            Spacer(modifier = Modifier.height(12.dp))
             if (passwordError != null) {
                 val fadeAlpha by animateFloatAsState(1f, tween(200))
                 Text(
@@ -304,40 +385,26 @@ fun SignUpScreen(onNext: () -> Unit) {
                 )
             }
             Spacer(modifier = Modifier.height(12.dp))
-            Box(
-                modifier = Modifier
-                    .border(
-                        BorderStroke(1.dp, if (confirmError != null) Color(0xFFFF0000) else Color(0xFFE5E7EB)),
-                        androidx.compose.foundation.shape.RoundedCornerShape(8.dp)
-                    )
-            ) {
-                TextField(
-                    value = confirm,
-                    onValueChange = {
-                        confirm = it
-                        if (confirm == password) confirmError = null
-                    },
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .height(48.dp),
-                    placeholder = { Text("Confirm password") },
-                    visualTransformation = if (showConfirm) androidx.compose.ui.text.input.VisualTransformation.None else PasswordVisualTransformation(),
-                    colors = TextFieldDefaults.textFieldColors(
-                        containerColor = if (confirmError != null) Color(0xFFFFE6E6) else Color(0xFFF3F4F6),
-                        focusedIndicatorColor = Color.Transparent,
-                        unfocusedIndicatorColor = Color.Transparent
-                    ),
-                    shape = androidx.compose.foundation.shape.RoundedCornerShape(8.dp),
-                    trailingIcon = {
-                        val interaction = remember { MutableInteractionSource() }
-                        val pressed by interaction.collectIsPressedAsState()
-                        val scale by animateFloatAsState(if (pressed) 0.9f else 1f, tween(80))
-                        IconButton(onClick = { showConfirm = !showConfirm }, interactionSource = interaction, modifier = Modifier.scale(scale)) {
-                            Icon(if (showConfirm) Icons.Filled.VisibilityOff else Icons.Filled.Visibility, contentDescription = "Toggle confirm")
-                        }
+            FormField(
+                value = confirm,
+                onValueChange = {
+                    confirm = it
+                    if (confirm == password) confirmError = null
+                },
+                placeholder = "Confirm password",
+                isError = confirmError != null,
+                trailingIcon = {
+                    val interaction = remember { MutableInteractionSource() }
+                    val pressed by interaction.collectIsPressedAsState()
+                    val scale by animateFloatAsState(if (pressed) 0.9f else 1f, tween(80))
+                    IconButton(onClick = { showConfirm = !showConfirm }, interactionSource = interaction, modifier = Modifier.scale(scale)) {
+                        Icon(if (showConfirm) Icons.Filled.VisibilityOff else Icons.Filled.Visibility, contentDescription = "Toggle confirm")
                     }
-                )
-            }
+                },
+                visualTransformation = if (showConfirm) androidx.compose.ui.text.input.VisualTransformation.None else PasswordVisualTransformation(),
+                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password)
+            )
+            Spacer(modifier = Modifier.height(16.dp))
             if (confirmError != null) {
                 val fadeAlpha by animateFloatAsState(1f, tween(200))
                 Text(
@@ -354,23 +421,38 @@ fun SignUpScreen(onNext: () -> Unit) {
                 modifier = Modifier
                     .fillMaxWidth()
                     .height(44.dp),
+                enabled = isFormValid && !isLoading,
                 onClick = {
                     try {
+                        registerError = null
                         usernameError = null
                         passwordError = null
                         confirmError = null
-                        if (password.length > 8) {
-                            passwordError = "Password maksimal 8 karakter"
-                            throw IllegalArgumentException(passwordError)
+                        if (email.isBlank()) { emailError = "Email harus diisi"; throw IllegalArgumentException(emailError) }
+                        if (!android.util.Patterns.EMAIL_ADDRESS.matcher(email.trim()).matches()) { emailError = "Email tidak valid"; throw IllegalArgumentException(emailError) }
+                        if (username.isBlank()) { usernameError = "Username harus diisi"; throw IllegalArgumentException(usernameError) }
+                        if (password.length < 6) { passwordError = "Password minimal 6 karakter"; throw IllegalArgumentException(passwordError) }
+                        if (password != confirm) { confirmError = "Password tidak sesuai"; throw IllegalArgumentException(confirmError) }
+                        isLoading = true
+                        FirebaseRepo.registerUser(email.trim(), password, username.trim()) { success, error ->
+                            isLoading = false
+                            if (success) {
+                                onNext()
+                            } else {
+                                registerError = error ?: "Registrasi gagal"
+                            }
                         }
-                        if (password != confirm) {
-                            confirmError = "Password tidak sesuai"
-                            throw IllegalArgumentException(confirmError)
-                        }
-                        onNext()
-                    } catch (_: Exception) { }
+                    } catch (e: Exception) { registerError = e.message ?: "Registrasi gagal" }
                 }
             )
+        }
+        if (registerError != null) {
+            ErrorModal(title = "Registrasi gagal", message = registerError!!, onDismiss = { registerError = null })
+        }
+        if (isLoading) {
+            Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                CircularProgressIndicator()
+            }
         }
     }
 }
@@ -468,25 +550,30 @@ fun OTPScreen(onBack: () -> Unit, onVerify: () -> Unit) {
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun HomeScreen() {
+fun HomeScreen(onLogout: () -> Unit) {
     val navController = rememberNavController()
     var selected by remember { mutableStateOf("home") }
+    var showMenu by remember { mutableStateOf(false) }
 
     Scaffold(
         topBar = {
-            TopHeaderBar(route = selected)
+            TopHeaderBar(route = selected, onLogout = onLogout, onOpenMenu = { if (selected == "profile") showMenu = true })
         },
-        bottomBar = {
-            Surface(color = Color.White.copy(alpha = 0.95f), shadowElevation = 8.dp) {
-                BottomNavBar(selectedRoute = selected, onSelect = { route ->
-                    selected = route
-                    navController.navigate(route) {
-                        launchSingleTop = true
-                        restoreState = true
-                        popUpTo(navController.graph.startDestinationId) { saveState = true }
-                    }
-                })
+        bottomBar = if (!showMenu) {
+            {
+                Surface(color = Color.White.copy(alpha = 0.95f), shadowElevation = 8.dp) {
+                    BottomNavBar(selectedRoute = selected, onSelect = { route ->
+                        selected = route
+                        navController.navigate(route) {
+                            launchSingleTop = true
+                            restoreState = true
+                            popUpTo(navController.graph.startDestinationId) { saveState = true }
+                        }
+                    })
+                }
             }
+        } else {
+            {}
         }
     ) { inner ->
         NavHost(
@@ -505,7 +592,14 @@ fun HomeScreen() {
             composable(
                 route = "create",
                 deepLinks = listOf(navDeepLink { uriPattern = "instaapp://create" })
-            ) { CreateTabContent() }
+            ) { CreateTabContent(onPosted = {
+                selected = "home"
+                navController.navigate("home") {
+                    launchSingleTop = true
+                    restoreState = true
+                    popUpTo(navController.graph.startDestinationId) { saveState = true }
+                }
+            }) }
             composable(
                 route = "activity",
                 deepLinks = listOf(navDeepLink { uriPattern = "instaapp://activity" })
@@ -516,7 +610,12 @@ fun HomeScreen() {
             ) { ProfileTabContent() }
         }
     }
-
+    if (showMenu) {
+        ProfileSideMenu(onClose = { showMenu = false }, onLogout = {
+            showMenu = false
+            onLogout()
+        })
+    }
     BackHandler(enabled = selected != "home") {
         navController.popBackStack()
         selected = navController.currentDestination?.route ?: "home"
@@ -524,11 +623,11 @@ fun HomeScreen() {
 }
 
 @Composable
-private fun TopHeaderBar(route: String) {
+private fun TopHeaderBar(route: String, onLogout: () -> Unit, onOpenMenu: () -> Unit) {
     val ctx = LocalContext.current
     Surface(color = Color.White.copy(alpha = 0.95f), shadowElevation = 4.dp) {
         when (route) {
-            "profile" -> ProfileTopHeaderBar()
+            "profile" -> ProfileTopHeaderBar(onLogout, onOpenMenu)
             else -> DefaultTopHeaderBar()
         }
     }
@@ -570,7 +669,7 @@ private fun DefaultTopHeaderBar() {
 }
 
 @Composable
-private fun ProfileTopHeaderBar() {
+private fun ProfileTopHeaderBar(onLogout: () -> Unit, onOpenMenu: () -> Unit) {
     val ctx = LocalContext.current
     Row(
         modifier = Modifier
@@ -593,9 +692,71 @@ private fun ProfileTopHeaderBar() {
         Image(
             painter = menuPainter,
             contentDescription = "Menu",
-            modifier = Modifier.size(22.dp).clickable { android.widget.Toast.makeText(ctx, "Menu", android.widget.Toast.LENGTH_SHORT).show() },
+            modifier = Modifier.size(22.dp).clickable { onOpenMenu() },
             colorFilter = ColorFilter.tint(Color(0xFF262626))
         )
+    }
+}
+
+@Composable
+private fun ProfileSideMenu(onClose: () -> Unit, onLogout: () -> Unit) {
+    BoxWithConstraints(modifier = Modifier.fillMaxSize()) {
+        val panelWidth = maxWidth * 0.65f
+        val targetOffset = maxWidth - panelWidth
+        val offsetX by animateDpAsState(targetValue = targetOffset, animationSpec = tween(220))
+        Box(
+            modifier = Modifier
+                .fillMaxSize()
+                .background(Color(0x1A000000))
+                .clickable { onClose() }
+        ) {}
+        Surface(
+            color = Color.White,
+            shadowElevation = 8.dp,
+            shape = androidx.compose.foundation.shape.RoundedCornerShape(0.dp),
+            modifier = Modifier
+                .width(panelWidth)
+                .fillMaxHeight()
+                .offset(x = offsetX)
+        ) {
+            val userLabel = Firebase.auth.currentUser?.email ?: "Profile"
+            Column(modifier = Modifier.fillMaxSize().padding(horizontal = 16.dp, vertical = 12.dp)) {
+                Text(userLabel, color = Color(0xFF262626), style = MaterialTheme.typography.titleMedium)
+                Spacer(modifier = Modifier.height(16.dp))
+                MenuItemRow(".libs/assets/svg/Icon.svg", "Archive") { }
+                MenuItemRow(".libs/assets/svg/Icon.svg", "Your Activity") { }
+                MenuItemRow(".libs/assets/svg/Icon.svg", "Nametag") { }
+                MenuItemRow(".libs/assets/svg/Icon.svg", "Saved") { }
+                MenuItemRow(".libs/assets/svg/Icon.svg", "Close Friends") { }
+                MenuItemRow(".libs/assets/svg/Icon.svg", "Discover People") { }
+                MenuItemRow(".libs/assets/svg/Icon.svg", "Open Facebook") { }
+                Spacer(modifier = Modifier.weight(1f))
+                Divider(color = Color(0xFFE0E0E0))
+                Spacer(modifier = Modifier.height(12.dp))
+                MenuItemRow(null, "Log out", danger = true) { onLogout() }
+                Spacer(modifier = Modifier.height(24.dp))
+            }
+        }
+    }
+}
+
+@Composable
+private fun MenuItemRow(iconPath: String?, label: String, danger: Boolean = false, onClick: () -> Unit) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(vertical = 10.dp)
+            .clickable { onClick() },
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        if (iconPath != null) {
+            val painter = rememberSvgPainterSafe(iconPath, ".libs/assets/svg/Icon.svg")
+            Image(painter = painter, contentDescription = label, modifier = Modifier.size(22.dp), colorFilter = ColorFilter.tint(Color(0xFF262626)))
+            Spacer(modifier = Modifier.width(12.dp))
+        } else {
+            Spacer(modifier = Modifier.width(4.dp))
+        }
+        Text(label, color = if (danger) Color(0xFFC62828) else Color(0xFF262626))
     }
 }
 
@@ -647,19 +808,34 @@ private fun HomeTabContent() {
         val listed = listPostImages(ctx)
         if (listed.isEmpty()) listOf("src/main/assets/png/Rectangle.png") else listed
     }
+    val latestPost = remember { mutableStateOf<PostItem?>(null) }
+    var latestPostLiked by remember { mutableStateOf(false) }
+    var latestShowComments by remember { mutableStateOf(false) }
+    var latestLikesCount by remember { mutableStateOf(0) }
+    val otherPosts = remember { mutableStateListOf<PostItem>() }
+    val likesCount = remember { mutableStateMapOf<Long, Int>() }
+    val likedMap = remember { mutableStateMapOf<Long, Boolean>() }
+    var activePostId by remember { mutableStateOf<Long?>(null) }
+    LaunchedEffect(Unit) {
+        com.example.instaapp.data.FirebaseRepo.fetchRecentPosts(20) { list, _ ->
+            val first = list?.firstOrNull()
+            latestPost.value = first
+            latestLikesCount = first?.likes ?: 0
+            otherPosts.clear()
+            list?.drop(1)?.let { ops ->
+                otherPosts.addAll(ops)
+                ops.forEach { p -> likesCount[p.id] = p.likes }
+            }
+        }
+    }
     var currentImage by remember { mutableStateOf(0) }
     var firebaseConnected by remember { mutableStateOf<Boolean?>(null) }
     LaunchedEffect(Unit) {
         try {
             if (FirebaseApp.getApps(ctx).isNotEmpty()) {
-                // timeout: set disconnected if no result within 10s
-                launch {
-                    delay(10_000)
-                    if (firebaseConnected == null) firebaseConnected = false
-                }
-                val id = UUID.randomUUID().toString()
+                val id = java.util.UUID.randomUUID().toString()
                 Firebase.firestore.collection("__health").document(id)
-                    .set(mapOf("ts" to FieldValue.serverTimestamp()))
+                    .set(mapOf("ts" to com.google.firebase.firestore.FieldValue.serverTimestamp()))
                     .addOnSuccessListener {
                         Firebase.firestore.collection("__health").document(id).get()
                             .addOnSuccessListener { firebaseConnected = true }
@@ -673,6 +849,131 @@ private fun HomeTabContent() {
     }
     Box(modifier = Modifier.fillMaxSize()) {
     LazyColumn(modifier = Modifier.fillMaxSize()) {
+        if (latestPost.value != null) {
+            item {
+                val p = latestPost.value!!
+                Column(modifier = Modifier.fillMaxWidth()) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 8.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.SpaceBetween
+                    ) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            val avatar = rememberSvgPainter(".libs/assets/svg/dummyfoto.svg")
+                            Image(painter = avatar, contentDescription = "Avatar", modifier = Modifier.size(32.dp).clip(CircleShape))
+                            Spacer(modifier = Modifier.width(8.dp))
+                            Column { Text("you", fontWeight = FontWeight.SemiBold, color = Color(0xFF262626)); Text("Just now", color = Color(0xFF8E8E8E), style = MaterialTheme.typography.labelSmall) }
+                        }
+                        Text("⋯", color = Color(0xFF9E9E9E))
+                    }
+                    if (p.kind == "image") {
+                        val painter = rememberAsyncImagePainter(p.uri)
+                        Image(painter = painter, contentDescription = "New post", modifier = Modifier.fillMaxWidth().aspectRatio(1f), contentScale = ContentScale.Crop)
+                    } else {
+                        AndroidView(factory = { viewContext ->
+                            android.widget.VideoView(viewContext).apply {
+                                setVideoURI(android.net.Uri.parse(p.uri))
+                                setOnPreparedListener { it.isLooping = false }
+                            }
+                        }, update = { vv ->
+                            vv.stopPlayback()
+                            vv.setVideoURI(android.net.Uri.parse(p.uri))
+                            vv.seekTo(1)
+                        }, modifier = Modifier.fillMaxWidth().aspectRatio(1f))
+                    }
+                    Row(
+                        modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 8.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.SpaceBetween
+                    ) {
+                        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                            val love = rememberSvgPainter(".libs/assets/svg/Icon.svg")
+                            Image(
+                                painter = love,
+                                contentDescription = "Like",
+                                modifier = Modifier.size(24.dp).clickable {
+                                    latestPostLiked = !latestPostLiked
+                                    latestLikesCount = if (latestPostLiked) latestLikesCount + 1 else maxOf(0, latestLikesCount - 1)
+                                    com.example.instaapp.data.FirebaseRepo.updatePostLike(p.id, latestPostLiked) { }
+                                },
+                                colorFilter = if (latestPostLiked) ColorFilter.tint(Color(0xFFFF0000)) else ColorFilter.tint(Color(0xFF262626)),
+                                contentScale = ContentScale.FillBounds,
+                                alignment = Alignment.Center
+                            )
+                        val comment = rememberSvgPainterSafe(".libs/assets/svg/Comment.svg", ".libs/assets/svg/search.svg")
+                            Image(painter = comment, contentDescription = "Comment", modifier = Modifier.size(24.dp).clickable { latestShowComments = true }, colorFilter = ColorFilter.tint(Color(0xFF262626)))
+                        val send = rememberSvgPainterSafe(".libs/assets/svg/Messanger.svg", ".libs/assets/svg/Icon.svg")
+                        Image(painter = send, contentDescription = "Send", modifier = Modifier.size(24.dp), colorFilter = ColorFilter.tint(Color(0xFF262626)))
+                    }
+                        Text("${latestLikesCount} likes", color = Color(0xFF9E9E9E), style = MaterialTheme.typography.labelSmall)
+                    }
+                    if (p.caption.isNotBlank()) {
+                        Text(p.caption, color = Color(0xFF262626), modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp))
+                    }
+                }
+            }
+        }
+        items(otherPosts, key = { it.id }) { p ->
+            Column(modifier = Modifier.fillMaxWidth()) {
+                Row(
+                    modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 8.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween
+                ) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        val avatar = rememberSvgPainter(".libs/assets/svg/dummyfoto.svg")
+                        Image(painter = avatar, contentDescription = "Avatar", modifier = Modifier.size(32.dp).clip(CircleShape))
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Column { Text("user", fontWeight = FontWeight.SemiBold, color = Color(0xFF262626)); Text("Recent", color = Color(0xFF8E8E8E), style = MaterialTheme.typography.labelSmall) }
+                    }
+                    Text("⋯", color = Color(0xFF9E9E9E))
+                }
+                if (p.kind == "image") {
+                    val painter = rememberAsyncImagePainter(p.uri)
+                    Image(painter = painter, contentDescription = "Post", modifier = Modifier.fillMaxWidth().aspectRatio(1f), contentScale = ContentScale.Crop)
+                } else {
+                    AndroidView(factory = { viewContext ->
+                        android.widget.VideoView(viewContext).apply {
+                            setVideoURI(android.net.Uri.parse(p.uri))
+                            setOnPreparedListener { it.isLooping = false }
+                        }
+                    }, update = { vv ->
+                        vv.stopPlayback(); vv.setVideoURI(android.net.Uri.parse(p.uri)); vv.seekTo(1)
+                    }, modifier = Modifier.fillMaxWidth().aspectRatio(1f))
+                }
+                Row(
+                    modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 8.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween
+                ) {
+                    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                        val love = rememberSvgPainter(".libs/assets/svg/Icon.svg")
+                        Image(
+                            painter = love,
+                            contentDescription = "Like",
+                            modifier = Modifier.size(24.dp).clickable {
+                                val newLiked = !(likedMap[p.id] ?: false)
+                                likedMap[p.id] = newLiked
+                                val cur = likesCount[p.id] ?: p.likes
+                                likesCount[p.id] = if (newLiked) cur + 1 else maxOf(0, cur - 1)
+                                com.example.instaapp.data.FirebaseRepo.updatePostLike(p.id, newLiked) { }
+                            },
+                            colorFilter = if (likedMap[p.id] == true) ColorFilter.tint(Color(0xFFFF0000)) else ColorFilter.tint(Color(0xFF262626)),
+                            contentScale = ContentScale.FillBounds,
+                            alignment = Alignment.Center
+                        )
+                        val comment = rememberSvgPainterSafe(".libs/assets/svg/Comment.svg", ".libs/assets/svg/search.svg")
+                        Image(painter = comment, contentDescription = "Comment", modifier = Modifier.size(24.dp).clickable { activePostId = p.id }, colorFilter = ColorFilter.tint(Color(0xFF262626)))
+                        val send = rememberSvgPainterSafe(".libs/assets/svg/Messanger.svg", ".libs/assets/svg/Icon.svg")
+                        Image(painter = send, contentDescription = "Send", modifier = Modifier.size(24.dp), colorFilter = ColorFilter.tint(Color(0xFF262626)))
+                    }
+                    Text("${likesCount[p.id] ?: p.likes} likes", color = Color(0xFF9E9E9E), style = MaterialTheme.typography.labelSmall)
+                }
+                if (p.caption.isNotBlank()) {
+                    Text(p.caption, color = Color(0xFF262626), modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp))
+                }
+            }
+        }
         item {
             Column(modifier = Modifier.fillMaxWidth()) {
                 Row(modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 4.dp), horizontalArrangement = Arrangement.End, verticalAlignment = Alignment.CenterVertically) {
@@ -712,7 +1013,10 @@ private fun HomeTabContent() {
                         Box(modifier = Modifier.weight(1f).fillMaxHeight().clickable { if (currentImage < images.size - 1) currentImage += 1 }) {}
                     }
                     Box(
-                        modifier = Modifier.align(Alignment.TopEnd).padding(8.dp).clip(androidx.compose.foundation.shape.RoundedCornerShape(12.dp)).background(Color(0x88000000))
+                        modifier = Modifier
+                            .align(Alignment.TopEnd)
+                            .padding(8.dp)
+                            .background(Color(0x88000000), shape = androidx.compose.foundation.shape.RoundedCornerShape(12.dp))
                     ) {
                         Text("${currentImage + 1}/${images.size}", color = Color.White, modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp), style = MaterialTheme.typography.labelSmall)
                     }
@@ -758,23 +1062,55 @@ private fun HomeTabContent() {
     CommentsOverlay(show = showComments, onClose = { showComments = false }) {
         CommentsSheet(onClose = { showComments = false })
     }
+    CommentsOverlay(show = latestShowComments, onClose = { latestShowComments = false }) {
+        val pid = latestPost.value?.id
+        CommentsSheet(onClose = { latestShowComments = false }, postId = pid)
+    }
+    CommentsOverlay(show = activePostId != null, onClose = { activePostId = null }) {
+        CommentsSheet(onClose = { activePostId = null }, postId = activePostId)
+    }
     }
 }
 
 // Custom overlay used instead of Material bottom sheet for compatibility
 
 @Composable
-private fun CommentsSheet(onClose: () -> Unit) {
+private fun CommentsSheet(onClose: () -> Unit, postId: Long? = null) {
     val ctx = LocalContext.current
     val scope = rememberCoroutineScope()
     val listState = rememberLazyListState()
-    val comments = remember {
-        val initial = loadComments(ctx)
-        if (initial.isEmpty()) mutableStateListOf(
-            UserComment(System.currentTimeMillis(), "grassrootssp", System.currentTimeMillis() - 28L * 24 * 60 * 60 * 1000, "Amazing, thank you so much for being a part of @mentalhealthunitedfc’s tournament for a second year. We are so grateful for such amazing community support all working together to help prevent suicide.❤️", 1, true),
-            UserComment(System.currentTimeMillis() - 1000, "chloesim___", System.currentTimeMillis() - 14_000, "Great work!", 0, false),
-            UserComment(System.currentTimeMillis() - 2000, "alexmkeith", System.currentTimeMillis() - 37_000, "👏👏👏", 0, false)
-        ) else mutableStateListOf<UserComment>().apply { addAll(initial.sortedByDescending { it.time }) }
+    val comments = remember { mutableStateListOf<UserComment>() }
+    var cloudEnabled by remember { mutableStateOf<Boolean?>(null) }
+    LaunchedEffect(postId) {
+        val loader: (List<UserComment>?, Exception?) -> Unit = { list, err ->
+            if (list != null) {
+                cloudEnabled = true
+                comments.clear()
+                comments.addAll(list)
+                persistComments(ctx, comments)
+            } else {
+                cloudEnabled = false
+                val initial = loadComments(ctx)
+                if (initial.isEmpty()) {
+                    comments.clear()
+                    comments.addAll(
+                        listOf(
+                            UserComment(System.currentTimeMillis(), "grassrootssp", System.currentTimeMillis() - 28L * 24 * 60 * 60 * 1000, "Amazing, thank you so much for being a part of @mentalhealthunitedfc’s tournament for a second year. We are so grateful for such amazing community support all working together to help prevent suicide.❤️", 1, true),
+                            UserComment(System.currentTimeMillis() - 1000, "chloesim___", System.currentTimeMillis() - 14_000, "Great work!", 0, false),
+                            UserComment(System.currentTimeMillis() - 2000, "alexmkeith", System.currentTimeMillis() - 37_000, "👏👏👏", 0, false)
+                        )
+                    )
+                } else {
+                    comments.clear()
+                    comments.addAll(initial.sortedByDescending { it.time })
+                }
+            }
+        }
+        if (postId != null) {
+            com.example.instaapp.data.FirebaseRepo.fetchCommentsForPost(postId, loader)
+        } else {
+            com.example.instaapp.data.FirebaseRepo.fetchComments(loader)
+        }
     }
     var input by remember { mutableStateOf("") }
     var error by remember { mutableStateOf<String?>(null) }
@@ -790,8 +1126,7 @@ private fun CommentsSheet(onClose: () -> Unit) {
             Box(modifier = Modifier
                 .width(40.dp)
                 .height(4.dp)
-                .clip(androidx.compose.foundation.shape.RoundedCornerShape(2.dp))
-                .background(Color(0xFFE0E0E0)))
+                .background(Color(0xFFE0E0E0), shape = androidx.compose.foundation.shape.RoundedCornerShape(2.dp)))
         }
         Row(modifier = Modifier.fillMaxWidth().padding(top = 8.dp, bottom = 12.dp), verticalAlignment = Alignment.CenterVertically) {
             Spacer(modifier = Modifier.weight(1f))
@@ -809,6 +1144,7 @@ private fun CommentsSheet(onClose: () -> Unit) {
                         c.liked = !c.liked
                         c.likes = if (c.liked) c.likes + 1 else maxOf(0, c.likes - 1)
                         persistComments(ctx, comments)
+                        com.example.instaapp.data.FirebaseRepo.updateLike(c.id, c.liked, c.likes) { }
                     }
                 )
             }
@@ -858,6 +1194,8 @@ private fun CommentsSheet(onClose: () -> Unit) {
                         val new = UserComment(System.currentTimeMillis(), "you", System.currentTimeMillis(), input.trim(), 0, false)
                         comments.add(0, new)
                         persistComments(ctx, comments)
+                        if (postId != null) com.example.instaapp.data.FirebaseRepo.postCommentForPost(postId, new) { }
+                        else com.example.instaapp.data.FirebaseRepo.postComment(new) { }
                         input = ""
                         postedTimestamps = recent + now
                         isPosting = false
@@ -916,9 +1254,62 @@ private fun SearchTabContent() {
 }
 
 @Composable
-private fun CreateTabContent() {
-    Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-        Text("Create Post")
+private fun CreateTabContent(onPosted: () -> Unit) {
+    val ctx = LocalContext.current
+    var mediaUrl by remember { mutableStateOf("") }
+    var caption by remember { mutableStateOf("") }
+    var error by remember { mutableStateOf<String?>(null) }
+    var posting by remember { mutableStateOf(false) }
+    
+
+    Column(modifier = Modifier.fillMaxSize().padding(16.dp)) {
+        TextField(
+            value = mediaUrl,
+            onValueChange = { mediaUrl = it.trim(); error = null },
+            modifier = Modifier.fillMaxWidth(),
+            placeholder = { Text("Media URL (https://)") },
+            colors = TextFieldDefaults.textFieldColors(
+                containerColor = Color(0xFFF3F4F6),
+                focusedIndicatorColor = Color.Transparent,
+                unfocusedIndicatorColor = Color.Transparent
+            )
+        )
+        Spacer(modifier = Modifier.height(16.dp))
+        Box(modifier = Modifier.fillMaxWidth().aspectRatio(1f).background(Color(0xFFF3F4F6)), contentAlignment = Alignment.Center) {
+            if (mediaUrl.isBlank()) {
+                Text("Masukkan URL media")
+            } else if (mediaUrl.endsWith(".mp4") || mediaUrl.contains("/video")) {
+                AndroidView(factory = { viewContext ->
+                    android.widget.VideoView(viewContext).apply {
+                        setVideoURI(android.net.Uri.parse(mediaUrl))
+                        setOnPreparedListener { it.isLooping = false }
+                    }
+                }, update = { vv ->
+                    vv.stopPlayback(); vv.setVideoURI(android.net.Uri.parse(mediaUrl))
+                }, modifier = Modifier.fillMaxSize())
+            } else {
+                val painter = rememberAsyncImagePainter(mediaUrl)
+                Image(painter = painter, contentDescription = "Preview", modifier = Modifier.fillMaxSize())
+            }
+        }
+        Spacer(modifier = Modifier.height(16.dp))
+        FormField(value = caption, onValueChange = { caption = it }, placeholder = "Caption", keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Text))
+        Spacer(modifier = Modifier.height(16.dp))
+        PrimaryButton(text = if (posting) "Posting..." else "Post", enabled = !posting && mediaUrl.isNotBlank(), onClick = {
+            val low = mediaUrl.lowercase()
+            if (!low.startsWith("http")) { error = "Masukkan URL HTTPS"; return@PrimaryButton }
+            posting = true
+            com.example.instaapp.data.FirebaseRepo.createPostFromUrl(mediaUrl.trim(), caption.trim()) { success, err ->
+                posting = false
+                if (success) {
+                    caption = ""; mediaUrl = ""; error = null; onPosted()
+                } else { error = err ?: "Gagal posting" }
+            }
+        })
+        if (error != null) {
+            Spacer(modifier = Modifier.height(8.dp))
+            Text(error!!, color = Color(0xFFFF0000), style = MaterialTheme.typography.labelSmall)
+        }
     }
 }
 
@@ -1084,6 +1475,7 @@ private fun BackIcon(modifier: Modifier = Modifier, onClick: () -> Unit) {
 private fun PrimaryButton(
     text: String,
     modifier: Modifier = Modifier,
+    enabled: Boolean = true,
     onClick: () -> Unit
 ) {
     val interactionSource = remember { MutableInteractionSource() }
@@ -1102,10 +1494,48 @@ private fun PrimaryButton(
         interactionSource = interactionSource,
         modifier = modifier
             .scale(scale),
+        enabled = enabled,
         colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF3897F0))
     ) {
         Text(text, color = Color.White)
     }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun FormField(
+    value: String,
+    onValueChange: (String) -> Unit,
+    placeholder: String,
+    isError: Boolean = false,
+    trailingIcon: @Composable (() -> Unit)? = null,
+    visualTransformation: VisualTransformation = androidx.compose.ui.text.input.VisualTransformation.None,
+    keyboardOptions: KeyboardOptions = KeyboardOptions.Default,
+    modifier: Modifier = Modifier
+) {
+    OutlinedTextField(
+        value = value,
+        onValueChange = onValueChange,
+        modifier = modifier
+            .fillMaxWidth()
+            .heightIn(min = 56.dp),
+        singleLine = true,
+        maxLines = 1,
+        placeholder = { Text(placeholder) },
+        isError = isError,
+        visualTransformation = visualTransformation,
+        keyboardOptions = keyboardOptions,
+        shape = androidx.compose.foundation.shape.RoundedCornerShape(8.dp),
+        trailingIcon = trailingIcon,
+        colors = TextFieldDefaults.outlinedTextFieldColors(
+            focusedBorderColor = Color(0xFFE5E7EB),
+            unfocusedBorderColor = Color(0xFFE5E7EB),
+            errorBorderColor = Color(0xFFE5E7EB),
+            cursorColor = Color.Black,
+            placeholderColor = Color(0xFF9E9E9E),
+            containerColor = Color.White
+        )
+    )
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -1181,8 +1611,9 @@ private fun CredentialLoginView(
     onSubmit: (String, String) -> Unit,
     onSignUp: () -> Unit
 ) {
-    var username by remember { mutableStateOf("asad_khasanov") }
+    var username by remember { mutableStateOf("") }
     var password by remember { mutableStateOf("") }
+    val isFormValid = username.isNotBlank() && password.isNotBlank()
 
     Box(
         modifier = Modifier.fillMaxSize(),
@@ -1203,36 +1634,20 @@ private fun CredentialLoginView(
 
             Spacer(modifier = Modifier.height(24.dp))
 
-            TextField(
+            FormField(
                 value = username,
                 onValueChange = { username = it },
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .height(48.dp),
-                placeholder = { Text("Username") },
-                colors = TextFieldDefaults.textFieldColors(
-                    containerColor = Color(0xFFF3F4F6),
-                    focusedIndicatorColor = Color.Transparent,
-                    unfocusedIndicatorColor = Color.Transparent
-                ),
-                shape = androidx.compose.foundation.shape.RoundedCornerShape(8.dp)
+                placeholder = "Email",
+                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Email)
             )
 
             Spacer(modifier = Modifier.height(12.dp))
-            TextField(
+            FormField(
                 value = password,
                 onValueChange = { password = it },
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .height(48.dp),
-                placeholder = { Text("Password") },
+                placeholder = "Password",
                 visualTransformation = PasswordVisualTransformation(),
-                colors = TextFieldDefaults.textFieldColors(
-                    containerColor = Color(0xFFF3F4F6),
-                    focusedIndicatorColor = Color.Transparent,
-                    unfocusedIndicatorColor = Color.Transparent
-                ),
-                shape = androidx.compose.foundation.shape.RoundedCornerShape(8.dp)
+                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password)
             )
 
             Box(modifier = Modifier.fillMaxWidth()) {
@@ -1251,6 +1666,7 @@ private fun CredentialLoginView(
                 modifier = Modifier
                     .fillMaxWidth()
                     .height(44.dp),
+                enabled = isFormValid,
                 onClick = { onSubmit(username, password) }
             )
 
@@ -1309,7 +1725,7 @@ private fun CredentialLoginView(
 @Composable
 fun LoginScreenPreview() {
     InstaAppTheme {
-        LoginScreen(onSignUp = {})
+        LoginScreen(onSignUp = {}, onLoggedIn = {})
     }
 }
 @Composable
